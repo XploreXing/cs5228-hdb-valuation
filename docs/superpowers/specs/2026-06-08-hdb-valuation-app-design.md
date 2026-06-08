@@ -202,16 +202,38 @@ real-estate domain knowledge.
 
 ## 5. UI Layout (Streamlit)
 
+### 5.1 Input — Backend Conversion Logic
+
+User selects from pre-defined dropdowns. Backend converts to model features
+**before** feeding into the inference pipeline:
+
+| User input | Widget | Options source | Conversion to feature |
+|-----------|--------|---------------|----------------------|
+| Postal Code | `text_input` (6 digits) | — | `postal_code → LATITUDE, LONGITUDE, MAX_FLOOR, LEASE_COMMENCE_DATE` via `hdb-block-details` |
+| Flat Type | `selectbox` | Hardcoded: 2-room, 3-room, 4-room, 5-room, Executive, Multi-Generation | `FLAT_TYPE_ENCODED` (ordinal, 1–7) |
+| Flat Model | `selectbox` | Dynamically populated: `train.FLAT_MODEL.unique()` (23 categories) | One-hot encoded (23 columns aligned to training) |
+| Floor Level | `selectbox` | Hardcoded ranges: `01 to 03`, `04 to 06`, `07 to 09`, `10 to 12`, … (dynamic from `MAX_FLOOR`) | `FLOOR_LEVEL_MID = midpoint(range)` |
+| Floor Area | `number_input` | 30–280 sqm, step=1 | `FLOOR_AREA_SQM` (passed through as-is) |
+
+Floor level conversion example:
+```
+User selects: "07 to 09"
+  → mid = (7 + 9) / 2 = 8.0
+  → FLOOR_LEVEL_MID = 8.0
+```
+
+### 5.2 Layout
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  🏠 HDB Resale Price Valuation                              │
 │                                                              │
 │  ┌─ INPUT (sidebar) ────────────────────────────────────┐  │
 │  │  Postal Code    [______]  (6 digits)                  │  │
-│  │  Flat Type      [▼ 4-room]                            │  │
+│  │  Flat Type      [▼ 4-Room]                            │  │
 │  │  Flat Model     [▼ Model A]                           │  │
-│  │  Floor Area     [___] sqm                             │  │
-│  │  Floor Level    [__]  (midpoint, e.g. 8 for 07-09)   │  │
+│  │  Floor Level    [▼ 07 to 09]                          │  │
+│  │  Floor Area     [  90  ] sqm  (± buttons)            │  │
 │  │                                                       │  │
 │  │  [  Get Valuation  ]                                  │  │
 │  └───────────────────────────────────────────────────────┘  │
@@ -366,18 +388,21 @@ Errors are user-facing with actionable messages, not raw Python exceptions.
 
 ## 9. Input Constraints & Validation
 
-| Field | Type | Constraints | Default |
-|-------|------|-------------|---------|
-| Postal code | str | 6-digit, must exist in hdb-block-details | — (required) |
-| Flat type | enum | `2-room`, `3-room`, `4-room`, `5-room`, `executive`, `multi-generation` | `4-room` |
-| Flat model | enum | Populated dynamically from train data (23 categories) | `Model A` |
-| Floor area (sqm) | float | 30–280 | 90 |
-| Floor level (mid) | int | 1–60 | auto: midpoint of floor range from dropdown OR manual input |
+| Field | Widget | Options/Constraints | Default |
+|-------|--------|---------------------|---------|
+| Postal code | `st.text_input` | 6 digits, must exist in `hdb-block-details` | — (required) |
+| Flat type | `st.selectbox` | `2-Room`, `3-Room`, `4-Room`, `5-Room`, `Executive`, `Multi-Generation` | `4-Room` |
+| Flat model | `st.selectbox` | Populated from `train.FLAT_MODEL.dropna().unique()` (~23 values) | `Model A` |
+| Floor level | `st.selectbox` | Ranges like `01 to 03`, `04 to 06`, … up to block's `MAX_FLOOR` | middle range |
+| Floor area | `st.number_input` | 30–280 sqm, step=1 | 90 |
 
-**Design note:** Floor level is entered as a **midpoint number** (e.g., 8 for
-`07 to 09`), matching how `FLOOR_LEVEL_MID` was computed in training.  Using a
-slider or number input is clearer than requiring users to understand floor
-range encoding.
+**Conversion table (UI → feature):**
+
+| UI value | Backend feature | Conversion |
+|----------|----------------|------------|
+| `"4-Room"` | `FLAT_TYPE_ENCODED` | `{"2-Room":1, "3-Room":2, "4-Room":3, "5-Room":4, "Executive":5, "Multi-Generation":6}` |
+| `"Model A"` | `FLAT_MODEL_model a` (one-hot) | Lowercased and matched to the 23-column one-hot schema |
+| `"07 to 09"` | `FLOOR_LEVEL_MID` | `(7 + 9) / 2 = 8.0` |
 
 ---
 
