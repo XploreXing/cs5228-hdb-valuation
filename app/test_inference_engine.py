@@ -8,13 +8,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 from app.inference_engine import (
     build_postal_lookup,
+    build_knn_index,
     load_amenity_dataframes,
+    FeatureBuilder,
     FLAT_MODEL_COLS,
     TOWN_COLS,
     NUMERICAL_FEATURES,
     FLAT_TYPE_MAP,
     PREMIUM_TOWNS,
     PROXIMITY_CONFIG,
+    TRAIN_CSV,
+    SCALER_PATH,
 )
 
 
@@ -71,3 +75,92 @@ def test_constants():
     assert len(PREMIUM_TOWNS) == 5
     # PROXIMITY_CONFIG
     assert set(PROXIMITY_CONFIG.keys()) == {"MRT", "HAWKER", "MALL", "PRIMARY", "SECONDARY"}
+
+
+# ── FeatureBuilder tests ──────────────────────────────────────────────
+
+import pickle
+import pandas as pd
+
+
+@pytest.fixture(scope="module")
+def feature_builder():
+    """Create a FeatureBuilder instance once for all tests."""
+    lookup = build_postal_lookup()
+    amen = load_amenity_dataframes()
+    train_df = pd.read_csv(TRAIN_CSV)
+    knn_index = build_knn_index(train_df)
+    knn_prices = train_df["RESALE_PRICE"].values.astype("float64")
+    with open(SCALER_PATH, "rb") as f:
+        scaler = pickle.load(f)
+    return FeatureBuilder(lookup, amen, knn_index, knn_prices, scaler, train_df)
+
+
+def test_feature_builder_shape(feature_builder):
+    """FeatureBuilder.build() should return single-row DataFrame."""
+    features = feature_builder.build(
+        postal_code="730205",
+        flat_type="4-Room",
+        flat_model="Model A",
+        floor_level_mid=8.0,
+        floor_area_sqm=90.0,
+    )
+    assert features.shape[0] == 1, f"Expected 1 row, got {features.shape[0]}"
+    assert features.shape[1] >= 80, f"Expected >=80 cols, got {features.shape[1]}"
+
+
+def test_feature_builder_no_nulls(feature_builder):
+    """FeatureBuilder output should have no NaN values."""
+    features = feature_builder.build(
+        postal_code="730205",
+        flat_type="4-Room",
+        flat_model="Model A",
+        floor_level_mid=8.0,
+        floor_area_sqm=90.0,
+    )
+    assert features.notna().all().all(), f"Found nulls: {features.isna().sum().to_dict()}"
+
+
+def test_feature_builder_model_onehot(feature_builder):
+    """Selected flat model should have its one-hot column set to 1."""
+    features = feature_builder.build(
+        postal_code="730205",
+        flat_type="4-Room",
+        flat_model="Model A",
+        floor_level_mid=8.0,
+        floor_area_sqm=90.0,
+    )
+    assert features["FLAT_MODEL_model a"].iloc[0] == 1
+
+
+def test_feature_builder_town_onehot(feature_builder):
+    """Town from postal code should get one-hot column set to 1."""
+    features = feature_builder.build(
+        postal_code="730205",
+        flat_type="4-Room",
+        flat_model="Model A",
+        floor_level_mid=8.0,
+        floor_area_sqm=90.0,
+    )
+    # 730205 is in Woodlands
+    assert features["TOWN_woodlands"].iloc[0] == 1
+
+
+def test_feature_builder_invalid_postal(feature_builder):
+    """Invalid postal code should raise ValueError."""
+    with pytest.raises(ValueError, match="not found"):
+        feature_builder.build(
+            postal_code="000000",
+            flat_type="4-Room",
+            flat_model="Model A",
+            floor_level_mid=8.0,
+            floor_area_sqm=90.0,
+        )
+
+
+def test_feature_builder_different_configs(feature_builder):
+    """Different inputs should produce different predictions later."""
+    feat1 = feature_builder.build("730205", "4-Room", "Model A", 8.0, 90.0)
+    feat2 = feature_builder.build("730205", "5-Room", "Model A", 8.0, 90.0)
+    # Different flat type encoding
+    assert feat1["FLAT_TYPE_ENCODED"].iloc[0] != feat2["FLAT_TYPE_ENCODED"].iloc[0]

@@ -183,3 +183,151 @@ def load_amenity_dataframes() -> dict:
         "PRIMARY":   pd.read_csv(PRIMARY_CSV),
         "SECONDARY": pd.read_csv(SECONDARY_CSV),
     }
+
+
+def build_knn_index(train_df: pd.DataFrame) -> NearestNeighbors:
+    """Build KD-Tree index from train coordinates."""
+    coords = train_df[["LATITUDE", "LONGITUDE"]].values.astype(np.float64)
+    nn = NearestNeighbors(n_neighbors=128, algorithm="kd_tree", metric="euclidean")
+    nn.fit(coords)
+    return nn
+
+
+# ── FeatureBuilder ────────────────────────────────────────────────────
+
+class FeatureBuilder:
+    """Build the 87-feature vector for a single HDB unit from user inputs."""
+
+    def __init__(
+        self,
+        postal_lookup: pd.DataFrame,
+        amenity_dfs: dict,
+        knn_index: NearestNeighbors,
+        knn_prices: np.ndarray,
+        scaler,
+        train_features_df: pd.DataFrame,
+    ):
+        self.postal_lookup = postal_lookup
+        self.amenity_dfs = amenity_dfs
+        self.knn_index = knn_index
+        self.knn_prices = knn_prices
+        self.scaler = scaler
+        self.train_features_df = train_features_df
+
+    def build(
+        self,
+        postal_code: str,
+        flat_type: str,
+        flat_model: str,
+        floor_level_mid: float,
+        floor_area_sqm: float,
+    ) -> pd.DataFrame:
+        """Build a single-row feature DataFrame ready for model inference."""
+        # Step 1: Lookup postal code
+        if postal_code not in self.postal_lookup.index:
+            raise ValueError(f"Postal code {postal_code} not found in database.")
+        info = self.postal_lookup.loc[postal_code]
+        lat = float(info["lat"])
+        lon = float(info["lon"])
+        max_floor = float(info["max_floor"])
+        town = str(info["town"])
+        year_completed = float(info["year_completed"])
+
+        # Current date for transaction year/month
+        from datetime import datetime
+        now = datetime.now()
+        transaction_year = now.year
+        transaction_month = now.month
+
+        # Step 2: Built-in features
+        remaining_age = 99.0 - transaction_year + year_completed
+        floor_level_ratio = floor_level_mid / max_floor if max_floor > 0 else 0.5
+        is_high_floor = 1 if floor_level_ratio >= 0.67 else 0
+        is_high_floor_premium = (
+            1 if (is_high_floor and town in PREMIUM_TOWNS) else 0
+        )
+
+        # Step 3: Proximity features
+        hdb_coords = pd.DataFrame({"LATITUDE": [lat], "LONGITUDE": [lon]})
+
+        proximity_parts = []
+        for amenity_name, config in PROXIMITY_CONFIG.items():
+            df_amenity = self.amenity_dfs[amenity_name]
+            features = create_auxiliary_location_features(
+                hdb_coords=hdb_coords,
+                auxilliary_df=df_amenity,
+                radii=config["radii"],
+                feature_prefix=amenity_name,
+            )
+            proximity_parts.append(features)
+
+        all_proximity = pd.concat(proximity_parts, axis=1)
+
+        # Step 4: KNN features
+        query_pt = np.array([[lat, lon]], dtype=np.float64)
+        _distances, indices = self.knn_index.kneighbors(query_pt, n_neighbors=128)
+        neighbor_prices = self.knn_prices[indices[0]]
+        knn_features = {}
+        for k in [16, 32, 64, 128]:
+            k_prices = neighbor_prices[:k]
+            knn_features[f"GEO_AVG_PRICE_K{k}"] = float(np.mean(k_prices))
+            knn_features[f"GEO_STD_PRICE_K{k}"] = float(np.std(k_prices))
+
+        # Step 5: Assemble numerical features dict
+        numerical = {
+            "FLOOR_AREA_SQM": floor_area_sqm,
+            "TRANSACTION_YEAR": float(transaction_year),
+            "TRANSACTION_MONTH": float(transaction_month),
+            "REMAINING_AGE": remaining_age,
+            "FLOOR_LEVEL_MID": float(floor_level_mid),
+            "MAX_FLOOR": max_floor,
+            "LATITUDE": lat,
+            "LONGITUDE": lon,
+        }
+        # Add proximity features
+        for col in NUMERICAL_FEATURES:
+            if col in all_proximity.columns:
+                numerical[col] = float(all_proximity[col].iloc[0])
+        # Add KNN features
+        numerical.update(knn_features)
+
+        # Step 6: Categorical encoding
+        flat_type_encoded = FLAT_TYPE_MAP.get(flat_type, 3)
+
+        model_key = flat_model.strip().lower()
+        model_onehot = {}
+        for col in FLAT_MODEL_COLS:
+            col_model = col.replace("FLAT_MODEL_", "").replace("_", " ")
+            model_onehot[col] = 1 if col_model == model_key else 0
+
+        town_onehot = {}
+        for col in TOWN_COLS:
+            col_town = col.replace("TOWN_", "")
+            town_onehot[col] = 1 if col_town == town else 0
+
+        # Step 7: Build single-row DataFrame
+        row = {
+            **numerical,
+            "FLAT_TYPE_ENCODED": float(flat_type_encoded),
+            "FLOOR_LEVEL_RATIO": floor_level_ratio,
+            "IS_HIGH_FLOOR": float(is_high_floor),
+            "IS_HIGH_FLOOR_IN_PREMIUM_TOWN": float(is_high_floor_premium),
+            **model_onehot,
+            **town_onehot,
+        }
+
+        result = pd.DataFrame([row])
+
+        # Ensure column order matches training exactly
+        train_cols = self.train_features_df.columns.tolist()
+        train_cols = [c for c in train_cols if c not in ("RESALE_PRICE", "LOG_RESALE_PRICE")]
+        for col in train_cols:
+            if col not in result.columns:
+                result[col] = 0.0
+        result = result[train_cols]
+
+        # Step 8: Standardize numerical features
+        num_cols = [c for c in NUMERICAL_FEATURES if c in result.columns]
+        result[num_cols] = self.scaler.transform(result[num_cols].astype(np.float64))
+
+        return result
