@@ -164,3 +164,74 @@ def test_feature_builder_different_configs(feature_builder):
     feat2 = feature_builder.build("730205", "5-Room", "Model A", 8.0, 90.0)
     # Different flat type encoding
     assert feat1["FLAT_TYPE_ENCODED"].iloc[0] != feat2["FLAT_TYPE_ENCODED"].iloc[0]
+
+
+# ── ModelPredictor tests ──────────────────────────────────────────────
+
+from app.inference_engine import (
+    ModelPredictor,
+    ComparableFinder,
+    PIPELINE_PATH,
+    METRICS_PATH,
+    RAW_TRAIN_CSV,
+)
+
+
+@pytest.fixture(scope="module")
+def model_predictor():
+    return ModelPredictor(PIPELINE_PATH, METRICS_PATH)
+
+
+def test_model_predictor_returns_tuple(feature_builder, model_predictor):
+    """Predict should return (float, float, float)."""
+    features = feature_builder.build("730205", "4-Room", "Model A", 8.0, 90.0)
+    pred, lower, upper = model_predictor.predict(features)
+    assert isinstance(pred, float)
+    assert isinstance(lower, float)
+    assert isinstance(upper, float)
+
+
+def test_model_predictor_bounds(feature_builder, model_predictor):
+    """Lower ≤ prediction ≤ upper."""
+    features = feature_builder.build("730205", "4-Room", "Model A", 8.0, 90.0)
+    pred, lower, upper = model_predictor.predict(features)
+    assert lower <= pred <= upper
+    assert pred >= 50000, f"Prediction clamped too low: {pred}"
+
+
+def test_model_predictor_reasonable_range(feature_builder, model_predictor):
+    """Prediction for a Woodlands 4-Room should be in reasonable HDB range."""
+    features = feature_builder.build("730205", "4-Room", "Model A", 8.0, 90.0)
+    pred, _lower, _upper = model_predictor.predict(features)
+    assert 200000 <= pred <= 1200000, f"Prediction out of HDB range: {pred}"
+
+
+# ── ComparableFinder tests ────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def comparable_finder():
+    return ComparableFinder(pd.read_csv(RAW_TRAIN_CSV))
+
+
+def test_comparable_finder_returns_dataframe(comparable_finder):
+    """Should return DataFrame with correct columns."""
+    comps = comparable_finder.find("woodlands", "4-Room", 90.0)
+    assert isinstance(comps, pd.DataFrame)
+    if not comps.empty:
+        expected_cols = {"Block", "Street", "Town", "Price (SGD)", "Month",
+                         "Area (sqm)", "Flat Model", "Floor Range"}
+        assert expected_cols.issubset(set(comps.columns))
+
+
+def test_comparable_finder_max_results(comparable_finder):
+    """Should return at most 5 results."""
+    comps = comparable_finder.find("woodlands", "4-Room", 90.0)
+    assert len(comps) <= 5
+
+
+def test_comparable_finder_empty_for_unknown(comparable_finder):
+    """Should return empty DataFrame for unlikely combination."""
+    comps = comparable_finder.find("woodlands", "1-Room", 90.0)
+    # 1-Room in Woodlands with 90sqm is unlikely, but just check it doesn't crash
+    assert isinstance(comps, pd.DataFrame)

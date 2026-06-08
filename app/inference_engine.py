@@ -331,3 +331,100 @@ class FeatureBuilder:
         result[num_cols] = self.scaler.transform(result[num_cols].astype(np.float64))
 
         return result
+
+
+# ── ModelPredictor ─────────────────────────────────────────────────────
+
+class ModelPredictor:
+    """Load the trained LightGBM pipeline and make predictions."""
+
+    def __init__(self, pipeline_path: Path, metrics_path: Path):
+        self.pipeline = joblib.load(pipeline_path)
+        with open(metrics_path, "r") as f:
+            metrics = json.load(f)
+        self.rmse_val = metrics["val"]["rmse"]
+        self.mae_val = metrics["val"]["mae"]
+
+    def predict(self, features: pd.DataFrame) -> Tuple[float, float, float]:
+        """Return (prediction, lower_bound, upper_bound)."""
+        pred = float(self.pipeline.predict(features)[0])
+        pred = max(pred, 50000.0)
+        lower = max(pred - self.rmse_val, 0.0)
+        upper = pred + self.rmse_val
+        return pred, lower, upper
+
+
+# ── ComparableFinder ───────────────────────────────────────────────────
+
+class ComparableFinder:
+    """Find comparable transactions from train data using rule-based filtering."""
+
+    def __init__(self, train_raw: pd.DataFrame):
+        self.train = train_raw
+        self.train["flat_type_clean"] = (
+            self.train["FLAT_TYPE"]
+            .str.replace(" room", "-room", case=False)
+            .str.replace(" ROOM", "-ROOM", case=False)
+        )
+        self.train["TOWN"] = self.train["TOWN"].str.strip().str.lower()
+
+    def find(
+        self,
+        town: str,
+        flat_type: str,
+        floor_area_sqm: float,
+        max_results: int = 5,
+    ) -> pd.DataFrame:
+        """Return top comparable transactions sorted by recency.
+
+        Filters:
+          1. Same flat_type (must match)
+          2. Same town (exact first; relax if < max_results)
+          3. Floor area within +/- 15 sqm
+          4. Transaction within last 2 years
+        """
+        df = self.train.copy()
+
+        flat_type_clean = flat_type.replace("-Room", "-room").replace(" ", "-")
+
+        # Filter 1: same flat type
+        df = df[df["flat_type_clean"] == flat_type_clean]
+
+        if df.empty:
+            return pd.DataFrame()
+
+        # Filter 2: same town (relax if too few)
+        town_df = df[df["TOWN"] == town]
+        if len(town_df) < max_results:
+            town_df = df
+
+        # Filter 3: similar floor area
+        town_df = town_df[
+            (town_df["FLOOR_AREA_SQM"] >= floor_area_sqm - 15)
+            & (town_df["FLOOR_AREA_SQM"] <= floor_area_sqm + 15)
+        ]
+
+        if town_df.empty:
+            return pd.DataFrame()
+
+        # Filter 4: recent 2 years
+        town_df = town_df.copy()
+        town_df["_year"] = town_df["MONTH"].str[:4].astype(int)
+        max_year = town_df["_year"].max()
+        town_df = town_df[town_df["_year"] >= max_year - 2]
+
+        # Sort by recency
+        town_df = town_df.sort_values("MONTH", ascending=False)
+
+        result = town_df.head(max_results)[
+            ["BLOCK", "STREET", "TOWN", "RESALE_PRICE", "MONTH",
+             "FLOOR_AREA_SQM", "FLAT_MODEL", "FLOOR_RANGE"]
+        ].copy()
+        result.columns = [
+            "Block", "Street", "Town", "Price (SGD)", "Month",
+            "Area (sqm)", "Flat Model", "Floor Range"
+        ]
+        result["Price (SGD)"] = result["Price (SGD)"].apply(
+            lambda x: f"${x:,.0f}"
+        )
+        return result
